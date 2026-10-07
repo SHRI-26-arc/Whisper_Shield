@@ -1,0 +1,45 @@
+name: whisper_shield
+description: "Whisper Shield - You are not alone."
+publish_to: 'none'
+
+version: 1.0.0+1
+
+environment:
+  sdk: '>=3.0.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+
+  # GPS / Location
+  geolocator: ^14.1.1
+
+  # Temporary files / recordings
+  path_provider: ^2.1.1
+
+  # Audio recording
+  record: ^6.0.0
+
+  # Phone / SMS / external links
+  url_launcher: ^6.3.3
+
+  # Secret phrase detection
+  speech_to_text: ^7.5.0
+
+  # HTTP communication with Node.js backend
+  http: ^1.2.0
+
+  # Real-time Socket.IO connection
+  socket_io_client: ^3.1.6
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+
+  flutter_lints: ^3.0.0
+
+flutter:
+  uses-material-design: true
+
+  assets:
+    - assets/
