@@ -8,11 +8,24 @@ import 'package:geolocator/geolocator.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:record/record.dart';
+import 'package:share_plus/share_plus.dart';
 import 'package:speech_to_text/speech_to_text.dart';
 import 'package:url_launcher/url_launcher.dart';
-import 'package:socket_io_client/socket_io_client.dart' as IO;
+import 'package:socket_io_client/socket_io_client.dart' as socket_io_client;
+import 'package:firebase_core/firebase_core.dart';
+import 'package:firebase_messaging/firebase_messaging.dart';
+import 'trusted_contacts_screen.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
-void main() {
+import 'firebase_options.dart';
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  await Firebase.initializeApp(
+    options: DefaultFirebaseOptions.currentPlatform,
+  );
+
   runApp(const WhisperShieldApp());
 }
 
@@ -21,34 +34,14 @@ void main() {
 // ============================================================
 
 class AppConfig {
-  // ----------------------------------------------------------
-  // ANDROID EMULATOR
-  // ----------------------------------------------------------
-  static const String backendUrl =
-      'http://10.0.2.2:3000';
+  static const String backendUrl = 'http://10.72.175.244:3000';
 
-  // ----------------------------------------------------------
-  // CHROME / WEB
-  // ----------------------------------------------------------
-  // static const String backendUrl =
-  //     'http://localhost:3000';
+  // For Chrome/web development, use localhost if your backend
+  // is running on the same computer.
+  // static const String backendUrl = 'http://localhost:3000';
 
-  // ----------------------------------------------------------
-  // PHYSICAL ANDROID PHONE
-  // ----------------------------------------------------------
-  // IMPORTANT:
-  // Replace with the IP address of the computer
-  // running your Node.js backend.
-  //
-  // Example:
-  // static const String backendUrl =
-  //     'http://192.168.1.5:3000';
-
-  static const String triggerEndpoint =
-      '$backendUrl/api/trigger';
-
-  static const String uploadEndpoint =
-      '$backendUrl/api/upload-audio';
+  static const String triggerEndpoint = '$backendUrl/api/trigger';
+  static const String uploadEndpoint = '$backendUrl/api/upload-audio';
 }
 
 // ============================================================
@@ -82,93 +75,50 @@ class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
 
   @override
-  State<HomeScreen> createState() =>
-      _HomeScreenState();
+  State<HomeScreen> createState() => _HomeScreenState();
 }
 
 class _HomeScreenState extends State<HomeScreen> {
-  // ==========================================================
   // SOS STATE
-  // ==========================================================
-
   Timer? _countdownTimer;
-
   int _countdown = 5;
-
   bool _countingDown = false;
   bool _sosActive = false;
 
-  // ==========================================================
   // AUDIO
-  // ==========================================================
-
-  final AudioRecorder _audioRecorder =
-      AudioRecorder();
-
+  final AudioRecorder _audioRecorder = AudioRecorder();
   bool _isRecording = false;
-
   String? _recordingPath;
 
-  // ==========================================================
   // GPS
-  // ==========================================================
-
   Position? _emergencyPosition;
 
-  // ==========================================================
   // SOS DATA
-  // ==========================================================
-
   Map<String, dynamic>? _sosData;
 
-  // ==========================================================
-  // SPEECH / SECRET PHRASE
-  // ==========================================================
-
-  final SpeechToText _speechToText =
-      SpeechToText();
-
+  // SECRET PHRASE
+  final SpeechToText _speechToText = SpeechToText();
   bool _keywordListening = false;
-
-  String _keywordStatus =
-      'Starting...';
-
+  String _keywordStatus = 'Starting...';
   bool _shouldKeepKeywordListening = true;
 
-  static const String secretPhrase =
-      'whisper shield';
+  static const String secretPhrase = 'whisper shield';
 
-  // ==========================================================
   // SOCKET.IO
-  // ==========================================================
-
-  IO.Socket? _socket;
-
+  socket_io_client.Socket? _socket;
   bool _socketConnected = false;
+  String _socketStatus = 'Connecting to emergency network...';
 
-  String _socketStatus =
-      'Connecting to emergency network...';
-
-  // ==========================================================
   // BACKEND ALERT
-  // ==========================================================
-
-  String _backendStatus =
-      'Backend not contacted';
-
+  String _backendStatus = 'Backend not contacted';
   bool _alertSentToBackend = false;
 
-  // ==========================================================
   // AUDIO UPLOAD
-  // ==========================================================
-
   bool _audioUploading = false;
-
   bool _audioUploaded = false;
+  String _audioUploadStatus = 'Audio not uploaded';
 
-  String _audioUploadStatus =
-      'Audio not uploaded';
-
+  // ==========================================================
   // ==========================================================
   // INITIALIZATION
   // ==========================================================
@@ -176,38 +126,110 @@ class _HomeScreenState extends State<HomeScreen> {
   @override
   void initState() {
     super.initState();
-
     _initializeSocket();
-
     _initializeKeywordSpotting();
+    _initializeFirebaseMessaging();
+  }
+
+  // ==========================================================
+  // FIREBASE CLOUD MESSAGING
+  // ==========================================================
+
+  Future<void> _initializeFirebaseMessaging() async {
+    try {
+      final messaging = FirebaseMessaging.instance;
+
+      // Request permission to display notifications.
+      final settings = await messaging.requestPermission(
+        alert: true,
+        badge: true,
+        sound: true,
+      );
+
+      debugPrint(
+        'Notification permission: ${settings.authorizationStatus}',
+      );
+
+      if (settings.authorizationStatus ==
+          AuthorizationStatus.denied) {
+        debugPrint('Notification permission denied.');
+        return;
+      }
+
+      // Get this phone's Firebase Cloud Messaging token.
+      final token = await messaging.getToken();
+
+      if (token != null) {
+        debugPrint('FCM DEVICE TOKEN: $token');
+      } else {
+        debugPrint('FCM token is not available yet.');
+      }
+
+      // Listen for refreshed device tokens.
+      FirebaseMessaging.instance.onTokenRefresh.listen(
+        (newToken) {
+          debugPrint('REFRESHED FCM TOKEN: $newToken');
+        },
+      );
+
+      // Handle notifications while the app is open.
+      FirebaseMessaging.onMessage.listen(
+        (RemoteMessage message) {
+          debugPrint(
+            'FCM notification received: '
+            '${message.notification?.title}',
+          );
+          debugPrint('FCM message data: ${message.data}');
+
+          if (!mounted) return;
+
+          ScaffoldMessenger.of(context).showSnackBar(
+            SnackBar(
+              content: Text(
+                message.notification?.title ??
+                    'New safety notification',
+              ),
+            ),
+          );
+        },
+      );
+    } catch (error, stackTrace) {
+      debugPrint('Firebase Messaging error: $error');
+      debugPrintStack(stackTrace: stackTrace);
+    }
   }
 
   @override
   void dispose() {
     _shouldKeepKeywordListening = false;
-
     _countdownTimer?.cancel();
-
     _socket?.disconnect();
-
     _socket?.dispose();
-
     _audioRecorder.dispose();
-
     _speechToText.stop();
-
     super.dispose();
   }
 
   // ==========================================================
-  // SOCKET.IO
+
+  // ==========================================================
+  // SOCKET.IO — REAL-TIME EMERGENCY NETWORK
   // ==========================================================
 
   void _initializeSocket() {
+    // Prevent duplicate socket connections.
+    if (_socket != null) {
+      debugPrint('Socket.IO is already initialized.');
+      return;
+    }
+
     try {
-      _socket = IO.io(
+      debugPrint('Initializing Socket.IO...');
+      debugPrint('Backend URL: ${AppConfig.backendUrl}');
+
+      _socket = socket_io_client.io(
         AppConfig.backendUrl,
-        IO.OptionBuilder()
+        socket_io_client.OptionBuilder()
             .setTransports(['websocket'])
             .disableAutoConnect()
             .enableReconnection()
@@ -217,124 +239,130 @@ class _HomeScreenState extends State<HomeScreen> {
             .build(),
       );
 
+      // ----------------------------------------------------------
+      // CONNECTION SUCCESS
+      // ----------------------------------------------------------
       _socket!.onConnect((_) {
-        debugPrint(
-          'Socket.IO connected',
-        );
+        debugPrint('====================================');
+        debugPrint('REAL-TIME NETWORK CONNECTED');
+        debugPrint('Socket ID: ${_socket?.id}');
+        debugPrint('====================================');
 
-        if (!mounted) {
-          return;
-        }
+        if (!mounted) return;
 
         setState(() {
           _socketConnected = true;
-
-          _socketStatus =
-              'Real-time emergency network connected';
+          _socketStatus = 'Real-time emergency network connected';
         });
       });
 
-      _socket!.onDisconnect((reason) {
-        debugPrint(
-          'Socket.IO disconnected: $reason',
-        );
-
-        if (!mounted) {
-          return;
-        }
-
-        setState(() {
-          _socketConnected = false;
-
-          _socketStatus =
-              'Real-time network disconnected';
-        });
-      });
-
+      // ----------------------------------------------------------
+      // CONNECTION FAILURE
+      // ----------------------------------------------------------
       _socket!.onConnectError((error) {
-        debugPrint(
-          'Socket.IO connection error: $error',
-        );
+        debugPrint('SOCKET CONNECTION ERROR: $error');
 
-        if (!mounted) {
-          return;
-        }
+        if (!mounted) return;
 
         setState(() {
           _socketConnected = false;
-
-          _socketStatus =
-              'Unable to connect to emergency network';
+          _socketStatus = 'Unable to connect to emergency network';
         });
       });
 
-      _socket!.on(
-        'alert_received',
-        (data) {
-          debugPrint(
-            'Alert acknowledgement: $data',
-          );
+      // ----------------------------------------------------------
+      // GENERAL SOCKET ERROR
+      // ----------------------------------------------------------
+      _socket!.onError((error) {
+        debugPrint('SOCKET ERROR: $error');
+      });
 
-          if (!mounted) {
-            return;
-          }
+      // ----------------------------------------------------------
+      // DISCONNECTION
+      // ----------------------------------------------------------
+      _socket!.onDisconnect((reason) {
+        debugPrint('SOCKET DISCONNECTED: $reason');
 
-          setState(() {
-            _backendStatus =
-                'Emergency alert acknowledged';
-          });
-        },
-      );
+        if (!mounted) return;
 
-      _socket!.on(
-        'update_alert',
-        (data) {
-          debugPrint(
-            'Alert updated: $data',
-          );
-        },
-      );
-
-      _socket!.connect();
-    } catch (error) {
-      debugPrint(
-        'Socket initialization error: $error',
-      );
-
-      if (mounted) {
         setState(() {
           _socketConnected = false;
-
-          _socketStatus =
-              'Real-time network unavailable';
+          _socketStatus = 'Real-time network disconnected';
         });
-      }
+      });
+
+      // ----------------------------------------------------------
+      // RECONNECTION ATTEMPTS
+      // ----------------------------------------------------------
+      _socket!.io.on('reconnect_attempt', (attempt) {
+        debugPrint('Socket reconnection attempt: $attempt');
+
+        if (!mounted) return;
+
+        setState(() {
+          _socketConnected = false;
+          _socketStatus = 'Reconnecting to emergency network...';
+        });
+      });
+
+      _socket!.io.on('reconnect', (attempt) {
+        debugPrint('Socket.IO reconnected after $attempt attempt(s)');
+      });
+
+      _socket!.io.on('reconnect_error', (error) {
+        debugPrint('SOCKET RECONNECTION ERROR: $error');
+      });
+
+      // ----------------------------------------------------------
+      // SERVER EVENT LISTENERS
+      // ----------------------------------------------------------
+      _socket!.on('alert_received', (data) {
+        debugPrint('Alert acknowledgement received: $data');
+      });
+
+      _socket!.on('update_alert', (data) {
+        debugPrint('Alert updated: $data');
+      });
+
+      _socket!.on('sos-alert', (data) {
+        debugPrint('SOS broadcast received: $data');
+      });
+
+      // ----------------------------------------------------------
+      // CONNECT
+      // ----------------------------------------------------------
+      debugPrint('Attempting to connect to backend...');
+      _socket!.connect();
+    } catch (error, stackTrace) {
+      debugPrint('SOCKET INITIALIZATION ERROR: $error');
+      debugPrintStack(stackTrace: stackTrace);
+
+      if (!mounted) return;
+
+      setState(() {
+        _socketConnected = false;
+        _socketStatus = 'Real-time network unavailable';
+      });
     }
   }
 
   // ==========================================================
-  // KEYWORD LISTENING
+  // SECRET PHRASE LISTENING
   // ==========================================================
 
-  Future<void>
-      _initializeKeywordSpotting() async {
+  Future<void> _initializeKeywordSpotting() async {
     if (kIsWeb) {
       if (mounted) {
         setState(() {
-          _keywordStatus =
-              'Keyword spotting requires Android/iOS';
+          _keywordStatus = 'Keyword spotting requires Android/iOS';
         });
       }
-
       return;
     }
 
-    final bool available =
-        await _speechToText.initialize(
+    final bool available = await _speechToText.initialize(
       onStatus: (status) {
-        debugPrint(
-          'Speech status: $status',
-        );
+        debugPrint('Speech status: $status');
 
         if (status == 'done') {
           _keywordListening = false;
@@ -342,28 +370,20 @@ class _HomeScreenState extends State<HomeScreen> {
           if (_shouldKeepKeywordListening &&
               !_sosActive &&
               !_countingDown) {
-            Future.delayed(
-              const Duration(
-                milliseconds: 300,
-              ),
-              () {
-                if (mounted &&
-                    _shouldKeepKeywordListening &&
-                    !_sosActive &&
-                    !_countingDown &&
-                    !_keywordListening) {
-                  _startKeywordListening();
-                }
-              },
-            );
+            Future.delayed(const Duration(milliseconds: 300), () {
+              if (mounted &&
+                  _shouldKeepKeywordListening &&
+                  !_sosActive &&
+                  !_countingDown &&
+                  !_keywordListening) {
+                _startKeywordListening();
+              }
+            });
           }
         }
       },
       onError: (error) {
-        debugPrint(
-          'Speech error: $error',
-        );
-
+        debugPrint('Speech error: $error');
         _keywordListening = false;
 
         if (mounted) {
@@ -376,18 +396,15 @@ class _HomeScreenState extends State<HomeScreen> {
         if (_shouldKeepKeywordListening &&
             !_sosActive &&
             !_countingDown) {
-          Future.delayed(
-            const Duration(seconds: 1),
-            () {
-              if (mounted &&
-                  _shouldKeepKeywordListening &&
-                  !_sosActive &&
-                  !_countingDown &&
-                  !_keywordListening) {
-                _startKeywordListening();
-              }
-            },
-          );
+          Future.delayed(const Duration(seconds: 1), () {
+            if (mounted &&
+                _shouldKeepKeywordListening &&
+                !_sosActive &&
+                !_countingDown &&
+                !_keywordListening) {
+              _startKeywordListening();
+            }
+          });
         }
       },
     );
@@ -395,11 +412,9 @@ class _HomeScreenState extends State<HomeScreen> {
     if (!available) {
       if (mounted) {
         setState(() {
-          _keywordStatus =
-              'Microphone permission needed';
+          _keywordStatus = 'Microphone permission needed';
         });
       }
-
       return;
     }
 
@@ -407,9 +422,7 @@ class _HomeScreenState extends State<HomeScreen> {
   }
 
   Future<void> _startKeywordListening() async {
-    if (_sosActive || _countingDown) {
-      return;
-    }
+    if (_sosActive || _countingDown) return;
 
     _shouldKeepKeywordListening = true;
 
@@ -417,50 +430,34 @@ class _HomeScreenState extends State<HomeScreen> {
       if (mounted) {
         setState(() {
           _keywordListening = false;
-
-          _keywordStatus =
-              'Speech recognition unavailable';
+          _keywordStatus = 'Speech recognition unavailable';
         });
       }
-
       return;
     }
 
-    if (_keywordListening) {
-      return;
-    }
+    if (_keywordListening) return;
 
     _keywordListening = true;
 
     try {
       await _speechToText.listen(
-        listenMode: ListenMode.dictation,
-        listenFor:
-            const Duration(minutes: 10),
-        pauseFor:
-            const Duration(seconds: 3),
         listenOptions: SpeechListenOptions(
+          listenMode: ListenMode.dictation,
+          listenFor: const Duration(minutes: 10),
+          pauseFor: const Duration(seconds: 3),
           partialResults: true,
           cancelOnError: false,
         ),
         onResult: (result) {
-          final String text = result
-              .recognizedWords
-              .toLowerCase()
-              .trim();
+          final String text =
+              result.recognizedWords.toLowerCase().trim();
 
-          debugPrint(
-            'Heard: $text',
-          );
+          debugPrint('Heard: $text');
 
-          if (text.contains(
-                'whisper shield',
-              ) ||
-              text.contains(
-                'whisper field',
-              ) ||
-              (text.contains('whisper') &&
-                  text.contains('shield'))) {
+          if (text.contains('whisper shield') ||
+              text.contains('whisper field') ||
+              (text.contains('whisper') && text.contains('shield'))) {
             _onKeywordDetected(0);
           }
         },
@@ -469,46 +466,36 @@ class _HomeScreenState extends State<HomeScreen> {
       if (mounted) {
         setState(() {
           _keywordListening = true;
-
-          _keywordStatus =
-              'Listening for "$secretPhrase"';
+          _keywordStatus = 'Listening for "$secretPhrase"';
         });
       }
     } catch (error) {
-      debugPrint(
-        'Keyword listener error: $error',
-      );
-
+      debugPrint('Keyword listener error: $error');
       _keywordListening = false;
 
       if (mounted) {
         setState(() {
-          _keywordStatus =
-              'Restarting keyword protection...';
+          _keywordStatus = 'Restarting keyword protection...';
         });
       }
 
       if (_shouldKeepKeywordListening &&
           !_sosActive &&
           !_countingDown) {
-        Future.delayed(
-          const Duration(seconds: 1),
-          () {
-            if (mounted &&
-                _shouldKeepKeywordListening &&
-                !_sosActive &&
-                !_countingDown &&
-                !_keywordListening) {
-              _startKeywordListening();
-            }
-          },
-        );
+        Future.delayed(const Duration(seconds: 1), () {
+          if (mounted &&
+              _shouldKeepKeywordListening &&
+              !_sosActive &&
+              !_countingDown &&
+              !_keywordListening) {
+            _startKeywordListening();
+          }
+        });
       }
     }
   }
 
-  Future<void>
-      _stopKeywordListening() async {
+  Future<void> _stopKeywordListening() async {
     _shouldKeepKeywordListening = false;
 
     try {
@@ -518,19 +505,13 @@ class _HomeScreenState extends State<HomeScreen> {
     if (mounted) {
       setState(() {
         _keywordListening = false;
-
-        _keywordStatus =
-            'Keyword protection paused';
+        _keywordStatus = 'Keyword protection paused';
       });
     }
   }
 
-  Future<void> _onKeywordDetected(
-    int keywordIndex,
-  ) async {
-    if (_sosActive || _countingDown) {
-      return;
-    }
+  Future<void> _onKeywordDetected(int keywordIndex) async {
+    if (_sosActive || _countingDown) return;
 
     await _stopKeywordListening();
 
@@ -545,9 +526,7 @@ class _HomeScreenState extends State<HomeScreen> {
   // ==========================================================
 
   Future<void> _startSosCountdown() async {
-    if (_sosActive || _countingDown) {
-      return;
-    }
+    if (_sosActive || _countingDown) return;
 
     await _stopKeywordListening();
 
@@ -568,11 +547,9 @@ class _HomeScreenState extends State<HomeScreen> {
       _countdown = seconds;
     });
 
-    final completer =
-        Completer<void>();
+    final completer = Completer<void>();
 
-    _countdownTimer =
-        Timer.periodic(
+    _countdownTimer = Timer.periodic(
       const Duration(seconds: 1),
       (timer) {
         if (_countdown > 1) {
@@ -593,9 +570,7 @@ class _HomeScreenState extends State<HomeScreen> {
 
     await completer.future;
 
-    if (!mounted || !_countingDown) {
-      return;
-    }
+    if (!mounted || !_countingDown) return;
 
     setState(() {
       _countingDown = false;
@@ -603,8 +578,7 @@ class _HomeScreenState extends State<HomeScreen> {
     });
 
     await _activateEmergencyMode(
-      triggeredByKeyword:
-          triggeredByKeyword,
+      triggeredByKeyword: triggeredByKeyword,
     );
   }
 
@@ -621,85 +595,57 @@ class _HomeScreenState extends State<HomeScreen> {
 
   // ==========================================================
   // GPS
-  // FIXED:
-  // GPS CAN NO LONGER BLOCK SOS FOREVER
   // ==========================================================
 
   Future<Position?> _getCurrentLocation() async {
     try {
       if (!await Geolocator.isLocationServiceEnabled()) {
-        debugPrint(
-          'Location services are disabled.',
-        );
-
+        debugPrint('Location services are disabled.');
         return null;
       }
 
       LocationPermission permission =
           await Geolocator.checkPermission();
 
-      if (permission ==
-          LocationPermission.denied) {
-        permission =
-            await Geolocator.requestPermission();
+      if (permission == LocationPermission.denied) {
+        permission = await Geolocator.requestPermission();
       }
 
-      if (permission ==
-              LocationPermission.denied ||
-          permission ==
-              LocationPermission.deniedForever) {
-        debugPrint(
-          'Location permission unavailable.',
-        );
-
-        return await Geolocator
-            .getLastKnownPosition();
+      if (permission == LocationPermission.denied ||
+          permission == LocationPermission.deniedForever) {
+        debugPrint('Location permission unavailable.');
+        return await Geolocator.getLastKnownPosition();
       }
 
       try {
-        final position =
-            await Geolocator
-                .getCurrentPosition(
-          locationSettings:
-              const LocationSettings(
-            accuracy:
-                LocationAccuracy.high,
-            timeLimit:
-                Duration(seconds: 8),
+        final position = await Geolocator.getCurrentPosition(
+          locationSettings: const LocationSettings(
+            accuracy: LocationAccuracy.high,
+            timeLimit: Duration(seconds: 8),
           ),
         );
 
         debugPrint(
-          'Fresh GPS: '
-          '${position.latitude}, '
-          '${position.longitude}',
+          'Fresh GPS: ${position.latitude}, ${position.longitude}',
         );
 
         return position;
-      } catch (e) {
-        debugPrint(
-          'Fresh GPS timed out: $e',
-        );
+      } catch (error) {
+        debugPrint('Fresh GPS timed out: $error');
 
-        final lastKnown =
-            await Geolocator
-                .getLastKnownPosition();
+        final lastKnown = await Geolocator.getLastKnownPosition();
 
         if (lastKnown != null) {
           debugPrint(
             'Using last known GPS: '
-            '${lastKnown.latitude}, '
-            '${lastKnown.longitude}',
+            '${lastKnown.latitude}, ${lastKnown.longitude}',
           );
         }
 
         return lastKnown;
       }
-    } catch (e) {
-      debugPrint(
-        'Location error: $e',
-      );
-
+    } catch (error) {
+      debugPrint('Location error: $error');
       return null;
     }
   }
@@ -708,132 +654,110 @@ class _HomeScreenState extends State<HomeScreen> {
   // AUDIO RECORDING
   // ==========================================================
 
-  Future<String>
-      _startEmergencyRecording() async {
-    if (!await _audioRecorder
-        .hasPermission()) {
-      throw Exception(
-        'Microphone permission was denied.',
-      );
-    }
-
-    final dir =
-        await getTemporaryDirectory();
-
-    final path =
-        '${dir.path}/whisper_shield_sos_${DateTime.now().millisecondsSinceEpoch}.m4a';
-
-    await _audioRecorder.start(
-      const RecordConfig(
-        encoder:
-            AudioEncoder.aacLc,
-        bitRate: 128000,
-        sampleRate: 44100,
-      ),
-      path: path,
-    );
-
-    _recordingPath = path;
-
-    return path;
+Future<String> _startEmergencyRecording() async {
+  if (!await _audioRecorder.hasPermission()) {
+    throw Exception('Microphone permission was denied.');
   }
+
+  // Persistent app-specific storage, not the temporary directory.
+  final dir = await getApplicationDocumentsDirectory();
+
+  final recordingsDir = Directory(
+    '${dir.path}/whisper_shield_recordings',
+  );
+
+  if (!await recordingsDir.exists()) {
+    await recordingsDir.create(recursive: true);
+  }
+
+  final path =
+      '${recordingsDir.path}/whisper_shield_sos_'
+      '${DateTime.now().millisecondsSinceEpoch}.m4a';
+
+  await _audioRecorder.start(
+    const RecordConfig(
+      encoder: AudioEncoder.aacLc,
+      bitRate: 128000,
+      sampleRate: 44100,
+    ),
+    path: path,
+  );
+
+  // Verify that the recorder actually started.
+  final recording = await _audioRecorder.isRecording();
+
+  if (!recording) {
+    throw Exception('Audio recorder did not start.');
+  }
+
+  _recordingPath = path;
+
+  debugPrint('Recording started: $path');
+
+  return path;
+}
 
   // ==========================================================
   // SEND SOS TO NODE BACKEND
-  // FIXED:
-  // BACKEND REQUEST HAS AN 8 SECOND TIMEOUT
   // ==========================================================
 
-  Future<int?>
-      _sendAlertToBackend({
-    required Position position,
+  Future<int?> _sendAlertToBackend({
+    required Position? position,
     required bool triggeredByKeyword,
   }) async {
     try {
       if (mounted) {
         setState(() {
-          _backendStatus =
-              'Sending emergency alert...';
-
+          _backendStatus = 'Sending emergency alert...';
           _alertSentToBackend = false;
         });
       }
 
-      final response =
-          await http
-              .post(
-        Uri.parse(
-          AppConfig.triggerEndpoint,
-        ),
-        headers: {
-          'Content-Type':
-              'application/json',
-        },
-        body: jsonEncode({
-          'triggerType':
-              triggeredByKeyword
-                  ? 'codeword'
-                  : 'manual_sos',
+      final response = await http
+          .post(
+            Uri.parse(AppConfig.triggerEndpoint),
+            headers: {
+              'Content-Type': 'application/json',
+            },
+            body: jsonEncode({
+              'triggerType':
+                  triggeredByKeyword ? 'codeword' : 'manual_sos',
+              'location': position == null
+                  ? null
+                  : {
+                      'lat': position.latitude,
+                      'lng': position.longitude,
+                      'accuracy': position.accuracy,
+                    },
+              'isOffline': false,
+              'timestamp':
+                  DateTime.now().toUtc().toIso8601String(),
+              'socketConnected': _socketConnected,
+            }),
+          )
+          .timeout(const Duration(seconds: 8));
 
-          'location': {
-            'lat':
-                position.latitude,
-            'lng':
-                position.longitude,
-            'accuracy':
-                position.accuracy,
-          },
-
-          'isOffline': false,
-
-          'timestamp':
-              DateTime.now()
-                  .toUtc()
-                  .toIso8601String(),
-
-          'socketConnected':
-              _socketConnected,
-        }),
-      )
-              .timeout(
-        const Duration(
-          seconds: 8,
-        ),
-      );
-
-      if (response.statusCode ==
-          200) {
-        debugPrint(
-          'SOS backend response: '
-          '${response.body}',
-        );
+      if (response.statusCode == 200) {
+        debugPrint('SOS backend response: ${response.body}');
 
         int? alertId;
 
         try {
-          final data =
-              jsonDecode(
-            response.body,
-          );
+          final data = jsonDecode(response.body);
 
-          if (data is Map &&
-              data['alertId'] !=
-                  null) {
-            alertId =
-                int.tryParse(
-              data['alertId']
-                  .toString(),
-            );
+          if (data is Map && data['alertId'] != null) {
+            alertId = int.tryParse(data['alertId'].toString());
           }
-        } catch (_) {}
+        } catch (error) {
+          debugPrint('Could not parse alert ID: $error');
+        }
 
         if (mounted) {
           setState(() {
-            _alertSentToBackend =
-                true;
-
-            _backendStatus =
-                'Emergency alert sent to backend';
+            _alertSentToBackend = alertId != null;
+            _backendStatus = alertId != null
+                ? 'Emergency alert sent to backend'
+                : 'Alert response missing alert ID';
           });
         }
 
@@ -849,15 +773,11 @@ class _HomeScreenState extends State<HomeScreen> {
 
       return null;
     } catch (error) {
-      debugPrint(
-        'Backend error: $error',
-      );
+      debugPrint('Backend error: $error');
 
       if (mounted) {
         setState(() {
-          _alertSentToBackend =
-              false;
-
+          _alertSentToBackend = false;
           _backendStatus =
               'Backend unavailable — local SOS continues';
         });
@@ -878,55 +798,74 @@ class _HomeScreenState extends State<HomeScreen> {
     if (filePath.isEmpty) {
       if (mounted) {
         setState(() {
-          _audioUploadStatus =
-              'No audio file available';
+          _audioUploading = false;
+          _audioUploaded = false;
+          _audioUploadStatus = 'No audio file available';
         });
       }
-
       return;
     }
 
-    final file =
-        File(filePath);
+    final file = File(filePath);
 
     if (!await file.exists()) {
       if (mounted) {
         setState(() {
-          _audioUploadStatus =
-              'Audio file not found';
+          _audioUploading = false;
+          _audioUploaded = false;
+          _audioUploadStatus = 'Audio file not found';
         });
       }
-
       return;
     }
 
-    try {
+    final fileSize = await file.length();
+
+    debugPrint('Audio path: $filePath');
+    debugPrint('Audio file size: $fileSize bytes');
+    debugPrint('Alert ID: $alertId');
+
+    if (fileSize == 0) {
       if (mounted) {
         setState(() {
-          _audioUploading = true;
-
+          _audioUploading = false;
           _audioUploaded = false;
+          _audioUploadStatus = 'Audio recording is empty';
+        });
+      }
+      return;
+    }
 
-          _audioUploadStatus =
-              'Uploading emergency audio...';
+    if (alertId == null) {
+      if (mounted) {
+        setState(() {
+          _audioUploading = false;
+          _audioUploaded = false;
+          _audioUploadStatus = 'Missing alert ID';
         });
       }
 
-      final request =
-          http.MultipartRequest(
+      debugPrint('Audio upload stopped: alertId is null');
+      return;
+    }
+
+    if (mounted) {
+      setState(() {
+        _audioUploading = true;
+        _audioUploaded = false;
+        _audioUploadStatus = 'Uploading audio...';
+      });
+    }
+
+    try {
+      final request = http.MultipartRequest(
         'POST',
-        Uri.parse(
-          AppConfig.uploadEndpoint,
-        ),
+        Uri.parse(AppConfig.uploadEndpoint),
       );
 
-      request.fields['alertId'] =
-          alertId?.toString() ?? '';
-
+      request.fields['alertId'] = alertId.toString();
       request.fields['timestamp'] =
-          DateTime.now()
-              .toUtc()
-              .toIso8601String();
+          DateTime.now().toUtc().toIso8601String();
 
       request.files.add(
         await http.MultipartFile.fromPath(
@@ -935,66 +874,39 @@ class _HomeScreenState extends State<HomeScreen> {
         ),
       );
 
-      final streamedResponse =
-          await request.send().timeout(
-        const Duration(
-          seconds: 20,
-        ),
-      );
+      final streamedResponse = await request
+          .send()
+          .timeout(const Duration(seconds: 60));
 
       final response =
-          await http.Response.fromStream(
-        streamedResponse,
-      );
+          await http.Response.fromStream(streamedResponse);
 
-      if (response.statusCode >=
-              200 &&
-          response.statusCode < 300) {
-        debugPrint(
-          'Audio upload successful: '
-          '${response.body}',
-        );
+      debugPrint('Audio upload HTTP status: ${response.statusCode}');
+      debugPrint('Audio upload response: ${response.body}');
 
-        if (mounted) {
-          setState(() {
-            _audioUploading = false;
-
-            _audioUploaded = true;
-
-            _audioUploadStatus =
-                'Emergency audio uploaded';
-          });
-        }
-      } else {
-        debugPrint(
-          'Audio upload failed: '
-          '${response.statusCode}',
-        );
-
-        if (mounted) {
-          setState(() {
-            _audioUploading = false;
-
-            _audioUploaded = false;
-
-            _audioUploadStatus =
-                'Audio upload failed';
-          });
-        }
-      }
-    } catch (error) {
-      debugPrint(
-        'Audio upload error: $error',
-      );
+      final success =
+          response.statusCode >= 200 &&
+          response.statusCode < 300;
 
       if (mounted) {
         setState(() {
           _audioUploading = false;
+          _audioUploaded = success;
+          _audioUploadStatus = success
+              ? 'Audio uploaded successfully '
+                  '(${(fileSize / 1024).toStringAsFixed(1)} KB)'
+              : 'Upload failed: HTTP ${response.statusCode}';
+        });
+      }
+    } catch (error, stackTrace) {
+      debugPrint('Audio upload error: $error');
+      debugPrintStack(stackTrace: stackTrace);
 
+      if (mounted) {
+        setState(() {
+          _audioUploading = false;
           _audioUploaded = false;
-
-          _audioUploadStatus =
-              'Cloud upload unavailable';
+          _audioUploadStatus = 'Audio upload failed: $error';
         });
       }
     }
@@ -1002,171 +914,79 @@ class _HomeScreenState extends State<HomeScreen> {
 
   // ==========================================================
   // ACTIVATE SOS
-  //
-  // IMPORTANT FIX:
-  // The Emergency Screen is allowed to open even when
-  // GPS is unavailable.
   // ==========================================================
 
   Future<void> _activateEmergencyMode({
     required bool triggeredByKeyword,
   }) async {
-    if (_sosActive) {
-      return;
-    }
+    if (_sosActive) return;
 
     try {
       await _stopKeywordListening();
 
-      debugPrint(
-        '🚨 SOS ACTIVATION STARTED',
-      );
-
-      // ------------------------------------------------------
-      // GET GPS
-      // ------------------------------------------------------
+      debugPrint('SOS ACTIVATION STARTED');
 
       Position? position;
 
       try {
-        position =
-            await _getCurrentLocation();
-      } catch (e) {
-        debugPrint(
-          'GPS failed: $e',
-        );
+        position = await _getCurrentLocation();
+      } catch (error) {
+        debugPrint('GPS failed: $error');
       }
 
-      debugPrint(
-        'GPS result: $position',
-      );
+      debugPrint('GPS result: $position');
 
-      if (!mounted) {
-        return;
-      }
-
-      // ------------------------------------------------------
-      // RESET SOS STATUS
-      // ------------------------------------------------------
+      if (!mounted) return;
 
       setState(() {
-        _emergencyPosition =
-            position;
-
-        _alertSentToBackend =
-            false;
-
-        _audioUploaded =
-            false;
-
-        _audioUploading =
-            false;
-
-        _backendStatus =
-            'Preparing emergency alert';
-
-        _audioUploadStatus =
-            'Audio not uploaded';
+        _emergencyPosition = position;
+        _alertSentToBackend = false;
+        _audioUploaded = false;
+        _audioUploading = false;
+        _backendStatus = 'Preparing emergency alert';
+        _audioUploadStatus = 'Audio not uploaded';
       });
-
-      // ------------------------------------------------------
-      // SEND BACKEND ALERT
-      // ONLY IF GPS IS AVAILABLE
-      // ------------------------------------------------------
-
-      int? alertId;
-
-      if (position != null) {
-        alertId =
-            await _sendAlertToBackend(
-          position:
-              position,
-          triggeredByKeyword:
-              triggeredByKeyword,
-        );
-      } else {
-        if (mounted) {
-          setState(() {
-            _backendStatus =
-                'GPS unavailable — emergency mode continues';
-          });
-        }
-      }
-
-      // ------------------------------------------------------
-      // START RECORDING
-      // ------------------------------------------------------
 
       String? audioPath;
 
       try {
-        audioPath =
-            await _startEmergencyRecording();
-
-        debugPrint(
-          '🎙️ Emergency recording started: '
-          '$audioPath',
-        );
-      } catch (e) {
-        debugPrint(
-          'Recording failed: $e',
-        );
+        audioPath = await _startEmergencyRecording();
+        debugPrint('Emergency recording started: $audioPath');
+      } catch (error) {
+        debugPrint('Recording failed: $error');
 
         if (mounted) {
           setState(() {
-            _audioUploadStatus =
-                'Microphone unavailable';
+            _audioUploadStatus = 'Microphone unavailable';
           });
         }
       }
+      final int? alertId = await _sendAlertToBackend(
+        position: position,
+        triggeredByKeyword: triggeredByKeyword,
+      );
 
-      // ------------------------------------------------------
-      // CREATE SOS DATA
-      // ------------------------------------------------------
-
-      final sosData = {
+      final sosData = <String, dynamic>{
         'eventType': 'SOS',
-
-        'trigger':
-            triggeredByKeyword
-                ? 'secret_phrase'
-                : 'manual_button',
-
-        'timestamp':
-            DateTime.now()
-                .toUtc()
-                .toIso8601String(),
-
+        'trigger': triggeredByKeyword
+            ? 'secret_phrase'
+            : 'manual_button',
+        'timestamp': DateTime.now().toUtc().toIso8601String(),
         'status': 'active',
-
-        'alertId':
-            alertId,
-
-        'location':
-            position == null
-                ? null
-                : {
-                    'latitude':
-                        position.latitude,
-                    'longitude':
-                        position.longitude,
-                    'accuracy':
-                        position.accuracy,
-                  },
-
+        'alertId': alertId,
+        'location': position == null
+            ? null
+            : {
+                'latitude': position.latitude,
+                'longitude': position.longitude,
+                'accuracy': position.accuracy,
+              },
         'audio': {
-          'filePath':
-              audioPath,
-          'format':
-              'm4a',
-          'uploaded':
-              false,
+          'filePath': audioPath,
+          'format': 'm4a',
+          'uploaded': false,
         },
       };
-
-      // ------------------------------------------------------
-      // ACTIVATE SOS STATE
-      // ------------------------------------------------------
 
       if (!mounted) {
         if (audioPath != null) {
@@ -1174,97 +994,77 @@ class _HomeScreenState extends State<HomeScreen> {
             await _audioRecorder.stop();
           } catch (_) {}
         }
-
         return;
       }
 
       setState(() {
         _sosActive = true;
-
-        _isRecording =
-            audioPath != null;
-
-        _recordingPath =
-            audioPath;
-
-        _sosData =
-            sosData;
+        _isRecording = audioPath != null;
+        _recordingPath = audioPath;
+        _sosData = sosData;
       });
 
-      debugPrint(
-        '🚨 Opening Emergency Screen...',
-      );
+debugPrint('Opening Emergency Screen...');
 
-      // ------------------------------------------------------
-      // OPEN EMERGENCY SCREEN
-      // ------------------------------------------------------
+await Navigator.push(
+  context,
+  MaterialPageRoute(
+    builder: (_) => EmergencyScreen(
+      position: _emergencyPosition,
+      recordingPath: _recordingPath,
+      isRecording: _isRecording,
+      sosData: _sosData,
+      triggeredByKeyword: triggeredByKeyword,
+      secretPhrase: secretPhrase,
+      socketConnected: _socketConnected,
+      backendStatus: _backendStatus,
+      alertSent: _alertSentToBackend,
+      audioUploading: _audioUploading,
+      audioUploaded: _audioUploaded,
+      audioUploadStatus: _audioUploadStatus,
+      onUploadAudio: () => _uploadEmergencyAudio(
+        filePath: audioPath ?? '',
+        alertId: alertId,
+      ),
+      onEndSos: _endSos,
+      onCallEmergencyServices: _callEmergencyServices,
+      onShareLocation: _shareCapturedLocation,
+      onMessageTrustedContact: () async {
+        final position = _emergencyPosition;
 
-      await Navigator.push(
-        context,
-        MaterialPageRoute(
-          builder: (_) =>
-              EmergencyScreen(
-            position:
-                _emergencyPosition,
+        if (position == null) {
+          if (!mounted) return;
 
-            recordingPath:
-                _recordingPath,
-
-            isRecording:
-                _isRecording,
-
-            sosData:
-                _sosData,
-
-            triggeredByKeyword:
-                triggeredByKeyword,
-
-            secretPhrase:
-                secretPhrase,
-
-            socketConnected:
-                _socketConnected,
-
-            backendStatus:
-                _backendStatus,
-
-            alertSent:
-                _alertSentToBackend,
-
-            audioUploading:
-                _audioUploading,
-
-            audioUploaded:
-                _audioUploaded,
-
-            audioUploadStatus:
-                _audioUploadStatus,
-
-            onUploadAudio:
-                () =>
-                    _uploadEmergencyAudio(
-              filePath:
-                  audioPath ??
-                      '',
-              alertId:
-                  alertId,
+          ScaffoldMessenger.of(context).showSnackBar(
+            const SnackBar(
+              content: Text('Location is not available yet.'),
             ),
+          );
+          return;
+        }
 
-            onEndSos:
-                _endSos,
+        await _prepareSosSms(
+          latitude: position.latitude,
+          longitude: position.longitude,
+        );
+      },
+    ),
+  ),
+);
 
-            onCallEmergencyServices:
-                _callEmergencyServices,
+// If the emergency screen is dismissed, restore a consistent
+// state and restart keyword protection.
+if (mounted && _sosActive) {
+  await _endSos();
+}
 
-            onShareLocation:
-                _shareCapturedLocation,
-          ),
-        ),
-      );
+// If the emergency screen is dismissed, restore a consistent
+// state and restart keyword protection.
+if (mounted && _sosActive) {
+  await _endSos();
+}
     } catch (error) {
-      debugPrint(
-        '❌ SOS ERROR: $error',
-      );
+      debugPrint('SOS ERROR: $error');
 
       if (_isRecording) {
         try {
@@ -1272,25 +1072,16 @@ class _HomeScreenState extends State<HomeScreen> {
         } catch (_) {}
       }
 
-      if (!mounted) {
-        return;
-      }
+      if (!mounted) return;
 
       setState(() {
-        _sosActive =
-            false;
-
-        _isRecording =
-            false;
+        _sosActive = false;
+        _isRecording = false;
       });
 
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(
+      ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text(
-            'Could not activate SOS: $error',
-          ),
+          content: Text('Could not activate SOS: $error'),
         ),
       );
 
@@ -1298,77 +1089,133 @@ class _HomeScreenState extends State<HomeScreen> {
     }
   }
 
+Future<void> _prepareSosSms({
+  required double latitude,
+  required double longitude,
+}) async {
+  try {
+    final prefs = await SharedPreferences.getInstance();
+    final savedContacts =
+        prefs.getString('whisper_shield_trusted_contacts');
+
+    if (savedContacts == null || savedContacts.trim().isEmpty) {
+      _showSmsMessage('Please add trusted contacts first.');
+      return;
+    }
+
+    final decoded = jsonDecode(savedContacts);
+
+    if (decoded is! List) {
+      _showSmsMessage('Could not read saved emergency contacts.');
+      return;
+    }
+
+    final contacts = decoded.whereType<Map>().toList();
+
+    if (contacts.isEmpty) {
+      _showSmsMessage('Please add trusted contacts first.');
+      return;
+    }
+
+    String? phone;
+
+    for (final contact in contacts) {
+      final candidate = (contact['phone'] ?? '').toString().trim();
+
+      if (candidate.isNotEmpty) {
+        phone = candidate;
+        break;
+      }
+    }
+
+    if (phone == null) {
+      _showSmsMessage('No valid trusted-contact phone number found.');
+      return;
+    }
+
+    final mapsUrl =
+        'https://www.google.com/maps/search/?api=1&query='
+        '$latitude,$longitude';
+
+    final message =
+        'SOS ALERT: I may need help. Please contact me immediately. '
+        'My current location: $mapsUrl';
+
+    final smsUri = Uri(
+      scheme: 'sms',
+      path: phone,
+      queryParameters: {'body': message},
+    );
+
+    final opened = await launchUrl(smsUri);
+
+    if (!opened) {
+      _showSmsMessage('Could not open the SMS app. Please try again.');
+    }
+  } catch (error, stackTrace) {
+    debugPrint('Prepare SOS SMS error: $error');
+    debugPrintStack(stackTrace: stackTrace);
+
+    _showSmsMessage('Unable to prepare the emergency SMS.');
+  }
+}
+
+void _showSmsMessage(String message) {
+  if (!mounted) return;
+
+  ScaffoldMessenger.of(context).showSnackBar(
+    SnackBar(content: Text(message)),
+  );
+}
+
+
   // ==========================================================
   // END SOS
   // ==========================================================
 
   Future<void> _endSos() async {
-    if (!_sosActive &&
-        !_isRecording) {
-      return;
-    }
+    if (!_sosActive && !_isRecording) return;
 
-    _shouldKeepKeywordListening =
-        false;
+    _shouldKeepKeywordListening = false;
 
     String? stoppedPath;
 
     try {
       if (_isRecording) {
-        stoppedPath =
-            await _audioRecorder.stop();
+        stoppedPath = await _audioRecorder.stop();
       }
-    } catch (_) {}
-
-    if (!mounted) {
-      return;
+    } catch (error) {
+      debugPrint('Could not stop recording: $error');
     }
 
-    setState(() {
-      _sosActive =
-          false;
+    if (!mounted) return;
 
-      _isRecording =
-          false;
+    setState(() {
+      _sosActive = false;
+      _isRecording = false;
 
       if (stoppedPath != null) {
-        _recordingPath =
-            stoppedPath;
+        _recordingPath = stoppedPath;
       }
     });
 
-    // --------------------------------------------------------
-    // UPLOAD FINISHED RECORDING
-    // --------------------------------------------------------
+    final path = _recordingPath;
+    final rawAlertId = _sosData?['alertId'];
 
-    final path =
-        _recordingPath;
-
-    final alertId =
-        _sosData?['alertId'];
+    final int? alertId = rawAlertId is int
+        ? rawAlertId
+        : int.tryParse(rawAlertId?.toString() ?? '');
 
     if (path != null) {
       await _uploadEmergencyAudio(
-        filePath:
-            path,
-        alertId:
-            alertId is int
-                ? alertId
-                : int.tryParse(
-                    alertId
-                            ?.toString() ??
-                        '',
-                  ),
+        filePath: path,
+        alertId: alertId,
       );
     }
 
-    // --------------------------------------------------------
-    // CLOSE EMERGENCY SCREEN
-    // --------------------------------------------------------
+    if (!mounted) return;
 
-    if (Navigator.canPop(
-      context,
-    )) {
+    if (Navigator.canPop(context)) {
       Navigator.pop(context);
     }
 
@@ -1379,16 +1226,13 @@ class _HomeScreenState extends State<HomeScreen> {
   // CALL EMERGENCY SERVICES
   // ==========================================================
 
-  Future<void>
-      _callEmergencyServices() async {
+  Future<void> _callEmergencyServices() async {
     final uri = Uri(
       scheme: 'tel',
       path: '112',
     );
 
-    if (await canLaunchUrl(
-      uri,
-    )) {
+    if (await canLaunchUrl(uri)) {
       await launchUrl(uri);
     }
   }
@@ -1397,30 +1241,51 @@ class _HomeScreenState extends State<HomeScreen> {
   // SHARE LOCATION
   // ==========================================================
 
-  Future<void>
-      _shareCapturedLocation() async {
-    final pos =
-        _emergencyPosition;
+  Future<void> _shareCapturedLocation() async {
+    final Position? pos = _emergencyPosition;
 
     if (pos == null) {
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Location is currently unavailable. Please check GPS permissions.',
+          ),
+        ),
+      );
       return;
     }
 
-    final mapsUrl =
-        'https://www.google.com/maps/search/?api=1&query=${pos.latitude},${pos.longitude}';
+    final String mapsUrl =
+        'https://www.google.com/maps/search/?api=1&query='
+        '${pos.latitude},${pos.longitude}';
 
-    final uri = Uri(
-      scheme: 'sms',
-      queryParameters: {
-        'body':
-            'Help! My location: $mapsUrl',
-      },
-    );
+    final String message =
+        'EMERGENCY — I need help.\n'
+        'My current location is:\n'
+        '$mapsUrl\n'
+        'Please contact me as soon as possible.';
 
-    if (await canLaunchUrl(
-      uri,
-    )) {
-      await launchUrl(uri);
+    try {
+      await SharePlus.instance.share(
+        ShareParams(
+          text: message,
+          subject: 'Whisper Shield SOS — Emergency Location',
+        ),
+      );
+    } catch (error) {
+      debugPrint('Location sharing failed: $error');
+
+      if (!mounted) return;
+
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text(
+            'Could not open sharing options. Please try again.',
+          ),
+        ),
+      );
     }
   }
 
@@ -1429,337 +1294,185 @@ class _HomeScreenState extends State<HomeScreen> {
   // ==========================================================
 
   @override
-  Widget build(
-    BuildContext context,
-  ) {
+  Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor:
-          const Color(0xFFF8F7FC),
-
+      backgroundColor: const Color(0xFFF8F7FC),
       appBar: AppBar(
         elevation: 0,
-        backgroundColor:
-            Colors.transparent,
-
+        backgroundColor: Colors.transparent,
         title: const Row(
           children: [
             Icon(
               Icons.shield_rounded,
-              color:
-                  Color(0xFF7C4DFF),
+              color: Color(0xFF7C4DFF),
               size: 30,
             ),
-
-            SizedBox(
-              width: 10,
-            ),
-
+            SizedBox(width: 10),
             Text(
               'Whisper Shield',
-              style: TextStyle(
-                fontWeight:
-                    FontWeight.bold,
-              ),
+              style: TextStyle(fontWeight: FontWeight.bold),
             ),
           ],
         ),
       ),
-
       body: SafeArea(
-        child:
-            SingleChildScrollView(
-          padding:
-              const EdgeInsets.all(20),
-
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(20),
           child: Column(
-            crossAxisAlignment:
-                CrossAxisAlignment.start,
-
+            crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              // ==================================================
-              // HEADER
-              // ==================================================
-
               Container(
-                width:
-                    double.infinity,
-
-                padding:
-                    const EdgeInsets.all(
-                  24,
-                ),
-
-                decoration:
-                    BoxDecoration(
-                  gradient:
-                      const LinearGradient(
+                width: double.infinity,
+                padding: const EdgeInsets.all(24),
+                decoration: BoxDecoration(
+                  gradient: const LinearGradient(
                     colors: [
-                      Color(
-                        0xFF7C4DFF,
-                      ),
-                      Color(
-                        0xFF9C6DFF,
-                      ),
+                      Color(0xFF7C4DFF),
+                      Color(0xFF9C6DFF),
                     ],
                   ),
-
-                  borderRadius:
-                      BorderRadius
-                          .circular(
-                    24,
-                  ),
+                  borderRadius: BorderRadius.circular(24),
                 ),
-
-                child:
-                    const Column(
-                  crossAxisAlignment:
-                      CrossAxisAlignment
-                          .start,
-
+                child: const Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
                       'You are protected.',
-                      style:
-                          TextStyle(
-                        color:
-                            Colors.white,
-                        fontSize:
-                            26,
-                        fontWeight:
-                            FontWeight
-                                .bold,
+                      style: TextStyle(
+                        color: Colors.white,
+                        fontSize: 26,
+                        fontWeight: FontWeight.bold,
                       ),
                     ),
-
-                    SizedBox(
-                      height: 8,
-                    ),
-
+                    SizedBox(height: 8),
                     Text(
                       'Whisper Shield is ready when you need it.',
-                      style:
-                          TextStyle(
-                        color:
-                            Colors.white70,
-                        fontSize:
-                            15,
+                      style: TextStyle(
+                        color: Colors.white70,
+                        fontSize: 15,
                       ),
                     ),
                   ],
                 ),
               ),
-
-              const SizedBox(
-                height: 20,
-              ),
-
+              const SizedBox(height: 20),
               _networkStatusCard(),
-
-              const SizedBox(
-                height: 18,
-              ),
-
+              const SizedBox(height: 18),
               _keywordStatusCard(),
-
-              const SizedBox(
-                height: 25,
-              ),
-
-              // ==================================================
-              // SOS BUTTON
-              // ==================================================
-
+              const SizedBox(height: 25),
               Center(
-                child:
-                    GestureDetector(
-                  onTap:
-                      _countingDown ||
-                              _sosActive
-                          ? null
-                          : _startSosCountdown,
-
-                  child:
-                      AnimatedContainer(
-                    duration:
-                        const Duration(
-                      milliseconds:
-                          250,
-                    ),
-
+                child: GestureDetector(
+                  onTap: _countingDown || _sosActive
+                      ? null
+                      : _startSosCountdown,
+                  child: AnimatedContainer(
+                    duration: const Duration(milliseconds: 250),
                     width: 190,
                     height: 190,
-
-                    decoration:
-                        BoxDecoration(
-                      shape:
-                          BoxShape.circle,
-
-                      color:
-                          Colors.red,
-
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: Colors.red,
                       boxShadow: [
                         BoxShadow(
-                          color: Colors
-                              .red
-                              .withOpacity(
-                            0.25,
-                          ),
-                          blurRadius:
-                              30,
-                          spreadRadius:
-                              8,
+                          color: Colors.red.withValues(alpha: 0.25),
+                          blurRadius: 30,
+                          spreadRadius: 8,
                         ),
                       ],
                     ),
-
                     child: Center(
-                      child:
-                          _countingDown
-                              ? Column(
-                                  mainAxisAlignment:
-                                      MainAxisAlignment
-                                          .center,
-                                  children: [
-                                    Text(
-                                      '$_countdown',
-                                      style:
-                                          const TextStyle(
-                                        color:
-                                            Colors.white,
-                                        fontSize:
-                                            58,
-                                        fontWeight:
-                                            FontWeight.bold,
-                                      ),
-                                    ),
-                                    const Text(
-                                      'GET READY',
-                                      style:
-                                          TextStyle(
-                                        color:
-                                            Colors.white,
-                                        fontSize:
-                                            13,
-                                        fontWeight:
-                                            FontWeight.bold,
-                                      ),
-                                    ),
-                                  ],
-                                )
-                              : const Column(
-                                  mainAxisAlignment:
-                                      MainAxisAlignment
-                                          .center,
-                                  children: [
-                                    Icon(
-                                      Icons.sos,
-                                      color:
-                                          Colors.white,
-                                      size:
-                                          55,
-                                    ),
-                                    SizedBox(
-                                      height:
-                                          8,
-                                    ),
-                                    Text(
-                                      'SOS',
-                                      style:
-                                          TextStyle(
-                                        color:
-                                            Colors.white,
-                                        fontSize:
-                                            24,
-                                        fontWeight:
-                                            FontWeight.bold,
-                                      ),
-                                    ),
-                                  ],
+                      child: _countingDown
+                          ? Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Text(
+                                  '$_countdown',
+                                  style: const TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 58,
+                                    fontWeight: FontWeight.bold,
+                                  ),
                                 ),
+                                const Text(
+                                  'GET READY',
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 13,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ],
+                            )
+                          : const Column(
+                              mainAxisAlignment: MainAxisAlignment.center,
+                              children: [
+                                Icon(
+                                  Icons.sos,
+                                  color: Colors.white,
+                                  size: 55,
+                                ),
+                                SizedBox(height: 8),
+                                Text(
+                                  'SOS',
+                                  style: TextStyle(
+                                    color: Colors.white,
+                                    fontSize: 24,
+                                    fontWeight: FontWeight.bold,
+                                  ),
+                                ),
+                              ],
+                            ),
                     ),
                   ),
                 ),
               ),
-
-              const SizedBox(
-                height: 20,
-              ),
-
+              const SizedBox(height: 20),
               if (_countingDown)
                 Center(
-                  child:
-                      OutlinedButton.icon(
-                    onPressed:
-                        _cancelCountdown,
-
-                    icon:
-                        const Icon(
-                      Icons.close,
-                    ),
-
-                    label:
-                        const Text(
-                      'CANCEL SOS',
-                    ),
+                  child: OutlinedButton.icon(
+                    onPressed: _cancelCountdown,
+                    icon: const Icon(Icons.close),
+                    label: const Text('CANCEL SOS'),
                   ),
                 ),
-
-              const SizedBox(
-                height: 30,
-              ),
-
+              const SizedBox(height: 30),
               _statusCard(),
-
-              const SizedBox(
-                height: 18,
-              ),
-
+              const SizedBox(height: 18),
               _sectionCard(
-                icon:
-                    Icons.contacts_rounded,
-                title:
-                    'Emergency Contacts',
-                subtitle:
-                    'Add trusted contacts.',
-                onTap: () {},
+                icon: Icons.contacts_rounded,
+                title: 'Emergency Contacts',
+                subtitle: 'Add and merge trusted contacts.',
+                onTap: () {
+                  Navigator.push(
+                    context,
+                    MaterialPageRoute(
+                      builder: (_) => const TrustedContactsScreen(),
+                    ),
+                  );
+                },
               ),
-
-              const SizedBox(
-                height: 14,
-              ),
-
+              const SizedBox(height: 14),
               _sectionCard(
-                icon:
-                    Icons.settings_rounded,
-                title:
-                    'Settings',
-                subtitle:
-                    'Manage preferences.',
-                onTap: () {},
+                icon: Icons.settings_rounded,
+                title: 'Settings',
+                subtitle: 'Manage preferences.',
+                onTap: () {
+                  ScaffoldMessenger.of(context).showSnackBar(
+                    const SnackBar(
+                      content: Text(
+                        'Settings are not implemented yet.',
+                      ),
+                    ),
+                  );
+                },
               ),
-
-              const SizedBox(
-                height: 25,
-              ),
-
+              const SizedBox(height: 25),
               SizedBox(
-                width:
-                    double.infinity,
-
-                child:
-                    OutlinedButton.icon(
-                  onPressed:
-                      _callEmergencyServices,
-
-                  icon:
-                      const Icon(
-                    Icons.phone,
-                  ),
-
-                  label:
-                      const Text(
-                    'Call Emergency Services',
-                  ),
+                width: double.infinity,
+                child: OutlinedButton.icon(
+                  onPressed: _callEmergencyServices,
+                  icon: const Icon(Icons.phone),
+                  label: const Text('Call Emergency Services'),
                 ),
               ),
             ],
@@ -1775,108 +1488,59 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Widget _networkStatusCard() {
     return Container(
-      width:
-          double.infinity,
-
-      padding:
-          const EdgeInsets.all(18),
-
-      decoration:
-          BoxDecoration(
-        color:
-            Colors.white,
-
-        borderRadius:
-            BorderRadius.circular(
-          20,
-        ),
-
-        border:
-            Border.all(
-          color:
-              _socketConnected
-                  ? Colors.green.shade200
-                  : Colors.orange.shade200,
+      width: double.infinity,
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(
+          color: _socketConnected
+              ? Colors.green.shade200
+              : Colors.orange.shade200,
         ),
       ),
-
       child: Row(
         children: [
           Container(
             width: 48,
             height: 48,
-
-            decoration:
-                BoxDecoration(
-              color:
-                  _socketConnected
-                      ? Colors.green.shade50
-                      : Colors.orange.shade50,
-
-              shape:
-                  BoxShape.circle,
+            decoration: BoxDecoration(
+              color: _socketConnected
+                  ? Colors.green.shade50
+                  : Colors.orange.shade50,
+              shape: BoxShape.circle,
             ),
-
             child: Icon(
-              _socketConnected
-                  ? Icons.cloud_done
-                  : Icons.cloud_off,
-
-              color:
-                  _socketConnected
-                      ? Colors.green
-                      : Colors.orange,
+              _socketConnected ? Icons.cloud_done : Icons.cloud_off,
+              color: _socketConnected ? Colors.green : Colors.orange,
             ),
           ),
-
-          const SizedBox(
-            width: 14,
-          ),
-
+          const SizedBox(width: 14),
           Expanded(
             child: Column(
-              crossAxisAlignment:
-                  CrossAxisAlignment.start,
-
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const Text(
                   'Real-Time Network',
-
                   style: TextStyle(
-                    fontWeight:
-                        FontWeight.bold,
-                    fontSize:
-                        16,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 16,
                   ),
                 ),
-
-                const SizedBox(
-                  height: 5,
-                ),
-
+                const SizedBox(height: 5),
                 Text(
                   _socketStatus,
-
                   style: TextStyle(
-                    color:
-                        Colors.grey.shade600,
-                    fontSize:
-                        13,
+                    color: Colors.grey.shade600,
+                    fontSize: 13,
                   ),
                 ),
               ],
             ),
           ),
-
           Icon(
-            _socketConnected
-                ? Icons.check_circle
-                : Icons.warning,
-
-            color:
-                _socketConnected
-                    ? Colors.green
-                    : Colors.orange,
+            _socketConnected ? Icons.check_circle : Icons.warning,
+            color: _socketConnected ? Colors.green : Colors.orange,
           ),
         ],
       ),
@@ -1888,109 +1552,61 @@ class _HomeScreenState extends State<HomeScreen> {
   // ==========================================================
 
   Widget _keywordStatusCard() {
-    final active =
-        _keywordListening;
+    final active = _keywordListening;
 
     return Container(
-      width:
-          double.infinity,
-
-      padding:
-          const EdgeInsets.all(18),
-
-      decoration:
-          BoxDecoration(
-        color:
-            Colors.white,
-
-        borderRadius:
-            BorderRadius.circular(
-          20,
-        ),
-
-        border:
-            Border.all(
-          color:
-              active
-                  ? Colors.green.shade200
-                  : Colors.orange.shade200,
+      width: double.infinity,
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(
+          color: active
+              ? Colors.green.shade200
+              : Colors.orange.shade200,
         ),
       ),
-
       child: Row(
         children: [
           Container(
             width: 48,
             height: 48,
-
-            decoration:
-                BoxDecoration(
-              color:
-                  active
-                      ? Colors.green.shade50
-                      : Colors.orange.shade50,
-
-              shape:
-                  BoxShape.circle,
+            decoration: BoxDecoration(
+              color: active
+                  ? Colors.green.shade50
+                  : Colors.orange.shade50,
+              shape: BoxShape.circle,
             ),
-
             child: Icon(
-              active
-                  ? Icons.graphic_eq
-                  : Icons.mic_off,
-
-              color:
-                  active
-                      ? Colors.green
-                      : Colors.orange,
+              active ? Icons.graphic_eq : Icons.mic_off,
+              color: active ? Colors.green : Colors.orange,
             ),
           ),
-
-          const SizedBox(
-            width: 14,
-          ),
-
+          const SizedBox(width: 14),
           Expanded(
             child: Column(
-              crossAxisAlignment:
-                  CrossAxisAlignment.start,
-
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 const Text(
                   'Secret Phrase Protection',
-
                   style: TextStyle(
-                    fontWeight:
-                        FontWeight.bold,
-                    fontSize:
-                        16,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 16,
                   ),
                 ),
-
-                const SizedBox(
-                  height: 5,
-                ),
-
+                const SizedBox(height: 5),
                 Text(
                   _keywordStatus,
-
                   style: TextStyle(
-                    color:
-                        Colors.grey.shade600,
-                    fontSize:
-                        13,
+                    color: Colors.grey.shade600,
+                    fontSize: 13,
                   ),
                 ),
               ],
             ),
           ),
-
           if (active)
-            const Icon(
-              Icons.check_circle,
-              color:
-                  Colors.green,
-            ),
+            const Icon(Icons.check_circle, color: Colors.green),
         ],
       ),
     );
@@ -2002,31 +1618,17 @@ class _HomeScreenState extends State<HomeScreen> {
 
   Widget _statusCard() {
     return Container(
-      width:
-          double.infinity,
-
-      padding:
-          const EdgeInsets.all(20),
-
-      decoration:
-          BoxDecoration(
-        color:
-            Colors.white,
-
-        borderRadius:
-            BorderRadius.circular(
-          20,
-        ),
-
-        border:
-            Border.all(
-          color:
-              _sosActive
-                  ? Colors.red.shade200
-                  : Colors.green.shade200,
+      width: double.infinity,
+      padding: const EdgeInsets.all(20),
+      decoration: BoxDecoration(
+        color: Colors.white,
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(
+          color: _sosActive
+              ? Colors.red.shade200
+              : Colors.green.shade200,
         ),
       ),
-
       child: Column(
         children: [
           Row(
@@ -2034,92 +1636,55 @@ class _HomeScreenState extends State<HomeScreen> {
               Container(
                 width: 50,
                 height: 50,
-
-                decoration:
-                    BoxDecoration(
-                  color:
-                      _sosActive
-                          ? Colors.red.shade50
-                          : Colors.green.shade50,
-
-                  shape:
-                      BoxShape.circle,
+                decoration: BoxDecoration(
+                  color: _sosActive
+                      ? Colors.red.shade50
+                      : Colors.green.shade50,
+                  shape: BoxShape.circle,
                 ),
-
                 child: Icon(
                   _sosActive
                       ? Icons.warning_rounded
-                      : Icons
-                          .verified_user_rounded,
-
-                  color:
-                      _sosActive
-                          ? Colors.red
-                          : Colors.green,
+                      : Icons.verified_user_rounded,
+                  color: _sosActive ? Colors.red : Colors.green,
                 ),
               ),
-
-              const SizedBox(
-                width: 15,
-              ),
-
+              const SizedBox(width: 15),
               Expanded(
                 child: Column(
-                  crossAxisAlignment:
-                      CrossAxisAlignment
-                          .start,
-
+                  crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
                     Text(
                       _sosActive
                           ? 'Emergency Mode Active'
                           : 'Protection Active',
-
-                      style:
-                          const TextStyle(
-                        fontSize:
-                            17,
-                        fontWeight:
-                            FontWeight
-                                .bold,
+                      style: const TextStyle(
+                        fontSize: 17,
+                        fontWeight: FontWeight.bold,
                       ),
                     ),
-
-                    const SizedBox(
-                      height: 5,
-                    ),
-
+                    const SizedBox(height: 5),
                     Text(
                       _sosActive
-                          ? 'GPS location captured and emergency recording is active.'
+                          ? (_isRecording
+                              ? 'Emergency recording is active.'
+                              : 'Emergency mode is active; recording is unavailable.')
                           : 'Whisper Shield is ready for emergencies.',
-
-                      style: TextStyle(
-                        color:
-                            Colors.grey.shade600,
-                      ),
+                      style: TextStyle(color: Colors.grey.shade600),
                     ),
                   ],
                 ),
               ),
             ],
           ),
-
           if (_sosActive) ...[
-            const SizedBox(
-              height: 18,
-            ),
-
+            const SizedBox(height: 18),
             _miniStatus(
               'Backend',
               _backendStatus,
               _alertSentToBackend,
             ),
-
-            const SizedBox(
-              height: 8,
-            ),
-
+            const SizedBox(height: 8),
             _miniStatus(
               'Audio',
               _audioUploadStatus,
@@ -2139,32 +1704,17 @@ class _HomeScreenState extends State<HomeScreen> {
     return Row(
       children: [
         Icon(
-          success
-              ? Icons.check_circle
-              : Icons.info_outline,
-
+          success ? Icons.check_circle : Icons.info_outline,
           size: 18,
-
-          color:
-              success
-                  ? Colors.green
-                  : Colors.orange,
+          color: success ? Colors.green : Colors.orange,
         ),
-
-        const SizedBox(
-          width: 8,
-        ),
-
+        const SizedBox(width: 8),
         Expanded(
           child: Text(
             '$title: $status',
-
             style: TextStyle(
-              fontSize:
-                  12,
-
-              color:
-                  Colors.grey.shade700,
+              fontSize: 12,
+              color: Colors.grey.shade700,
             ),
           ),
         ),
@@ -2183,105 +1733,52 @@ class _HomeScreenState extends State<HomeScreen> {
     required VoidCallback onTap,
   }) {
     return InkWell(
-      borderRadius:
-          BorderRadius.circular(
-        20,
-      ),
-
-      onTap:
-          onTap,
-
+      borderRadius: BorderRadius.circular(20),
+      onTap: onTap,
       child: Container(
-        padding:
-            const EdgeInsets.all(18),
-
-        decoration:
-            BoxDecoration(
-          color:
-              Colors.white,
-
-          borderRadius:
-              BorderRadius.circular(
-            20,
-          ),
+        padding: const EdgeInsets.all(18),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(20),
         ),
-
         child: Row(
           children: [
             Container(
               width: 48,
               height: 48,
-
-              decoration:
-                  BoxDecoration(
-                color:
-                    const Color(
-                  0xFFF0EBFF,
-                ),
-
-                borderRadius:
-                    BorderRadius.circular(
-                  14,
-                ),
+              decoration: BoxDecoration(
+                color: const Color(0xFFF0EBFF),
+                borderRadius: BorderRadius.circular(14),
               ),
-
               child: Icon(
                 icon,
-
-                color:
-                    const Color(
-                  0xFF7C4DFF,
-                ),
+                color: const Color(0xFF7C4DFF),
               ),
             ),
-
-            const SizedBox(
-              width: 15,
-            ),
-
+            const SizedBox(width: 15),
             Expanded(
               child: Column(
-                crossAxisAlignment:
-                    CrossAxisAlignment
-                        .start,
-
+                crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
                   Text(
                     title,
-
-                    style:
-                        const TextStyle(
-                      fontSize:
-                          16,
-                      fontWeight:
-                          FontWeight
-                              .bold,
+                    style: const TextStyle(
+                      fontSize: 16,
+                      fontWeight: FontWeight.bold,
                     ),
                   ),
-
-                  const SizedBox(
-                    height: 4,
-                  ),
-
+                  const SizedBox(height: 4),
                   Text(
                     subtitle,
-
                     style: TextStyle(
-                      color:
-                          Colors.grey.shade600,
-                      fontSize:
-                          13,
+                      color: Colors.grey.shade600,
+                      fontSize: 13,
                     ),
                   ),
                 ],
               ),
             ),
-
-            const Icon(
-              Icons.chevron_right,
-              color:
-                  Colors.grey,
-            ),
+            const Icon(Icons.chevron_right, color: Colors.grey),
           ],
         ),
       ),
@@ -2293,642 +1790,46 @@ class _HomeScreenState extends State<HomeScreen> {
 // EMERGENCY SCREEN
 // ============================================================
 
-class EmergencyScreen
-    extends StatelessWidget {
+class EmergencyScreen extends StatelessWidget {
   final Position? position;
-
   final String? recordingPath;
-
   final bool isRecording;
-
-  final Map<String, dynamic>?
-      sosData;
-
+  final Map<String, dynamic>? sosData;
   final bool triggeredByKeyword;
-
   final String secretPhrase;
-
   final bool socketConnected;
-
   final String backendStatus;
-
   final bool alertSent;
-
   final bool audioUploading;
-
   final bool audioUploaded;
-
   final String audioUploadStatus;
 
-  final Future<void> Function()
-      onUploadAudio;
-
-  final Future<void> Function()
-      onEndSos;
-
-  final Future<void> Function()
-      onCallEmergencyServices;
-
-  final Future<void> Function()
-      onShareLocation;
+  final Future<void> Function() onUploadAudio;
+  final Future<void> Function() onEndSos;
+  final Future<void> Function() onCallEmergencyServices;
+  final Future<void> Function() onShareLocation;
+  final Future<void> Function() onMessageTrustedContact;
 
   const EmergencyScreen({
     super.key,
-
     required this.position,
-
     required this.recordingPath,
-
     required this.isRecording,
-
     required this.sosData,
-
     required this.triggeredByKeyword,
-
     required this.secretPhrase,
-
     required this.socketConnected,
-
     required this.backendStatus,
-
     required this.alertSent,
-
     required this.audioUploading,
-
     required this.audioUploaded,
-
     required this.audioUploadStatus,
-
     required this.onUploadAudio,
-
     required this.onEndSos,
-
     required this.onCallEmergencyServices,
-
     required this.onShareLocation,
+    required this.onMessageTrustedContact,
   });
-
-  @override
-  Widget build(
-    BuildContext context,
-  ) {
-    final hasLocation =
-        position != null;
-
-    return PopScope(
-      canPop: false,
-
-      child: Scaffold(
-        backgroundColor:
-            const Color(
-          0xFF160909,
-        ),
-
-        body: SafeArea(
-          child:
-              SingleChildScrollView(
-            padding:
-                const EdgeInsets.all(
-              24,
-            ),
-
-            child: Column(
-              children: [
-                const SizedBox(
-                  height: 25,
-                ),
-
-                const Icon(
-                  Icons.warning_rounded,
-                  color:
-                      Colors.red,
-                  size: 65,
-                ),
-
-                const SizedBox(
-                  height: 15,
-                ),
-
-                const Text(
-                  'EMERGENCY MODE',
-
-                  style: TextStyle(
-                    color:
-                        Colors.white,
-                    fontSize:
-                        27,
-                    fontWeight:
-                        FontWeight.bold,
-                    letterSpacing:
-                        1,
-                  ),
-                ),
-
-                const SizedBox(
-                  height: 8,
-                ),
-
-                Text(
-                  triggeredByKeyword
-                      ? 'Activated by secret phrase'
-                      : 'Activated manually',
-
-                  style:
-                      const TextStyle(
-                    color:
-                        Colors.white70,
-                    fontSize:
-                        15,
-                  ),
-                ),
-
-                const SizedBox(
-                  height: 25,
-                ),
-
-                if (triggeredByKeyword)
-                  Container(
-                    width:
-                        double.infinity,
-
-                    padding:
-                        const EdgeInsets.all(
-                      16,
-                    ),
-
-                    decoration:
-                        BoxDecoration(
-                      color:
-                          Colors.red.withOpacity(
-                        0.12,
-                      ),
-
-                      borderRadius:
-                          BorderRadius.circular(
-                        16,
-                      ),
-
-                      border:
-                          Border.all(
-                        color:
-                            Colors.red.withOpacity(
-                          0.35,
-                        ),
-                      ),
-                    ),
-
-                    child: Row(
-                      children: [
-                        const Icon(
-                          Icons
-                              .record_voice_over,
-                          color:
-                              Colors.redAccent,
-                        ),
-
-                        const SizedBox(
-                          width: 12,
-                        ),
-
-                        Expanded(
-                          child: Text(
-                            'Secret phrase detected: "$secretPhrase"',
-
-                            style:
-                                const TextStyle(
-                              color:
-                                  Colors.white,
-                              fontSize:
-                                  13,
-                              fontWeight:
-                                  FontWeight.w600,
-                            ),
-                          ),
-                        ),
-                      ],
-                    ),
-                  ),
-
-                if (triggeredByKeyword)
-                  const SizedBox(
-                    height: 15,
-                  ),
-
-                _statusTile(
-                  icon:
-                      Icons.location_on,
-                  title:
-                      'GPS Location',
-                  status:
-                      hasLocation
-                          ? 'Location captured'
-                          : 'Location unavailable',
-                  active:
-                      hasLocation,
-                ),
-
-                const SizedBox(
-                  height: 15,
-                ),
-
-                _statusTile(
-                  icon:
-                      Icons.mic,
-                  title:
-                      'Emergency Audio',
-                  status:
-                      isRecording
-                          ? 'Recording active'
-                          : 'Recording stopped',
-                  active:
-                      isRecording,
-                ),
-
-                const SizedBox(
-                  height: 15,
-                ),
-
-                _statusTile(
-                  icon:
-                      Icons.cloud_done,
-                  title:
-                      'Backend Alert',
-                  status:
-                      alertSent
-                          ? 'Alert sent'
-                          : backendStatus,
-                  active:
-                      alertSent,
-                ),
-
-                const SizedBox(
-                  height: 15,
-                ),
-
-                _statusTile(
-                  icon:
-                      Icons.cloud_upload,
-                  title:
-                      'Cloud Audio',
-                  status:
-                      audioUploading
-                          ? 'Uploading...'
-                          : audioUploaded
-                              ? 'Uploaded'
-                              : audioUploadStatus,
-                  active:
-                      audioUploaded,
-                ),
-
-                const SizedBox(
-                  height: 15,
-                ),
-
-                _statusTile(
-                  icon:
-                      Icons.wifi,
-                  title:
-                      'Real-Time Network',
-                  status:
-                      socketConnected
-                          ? 'Socket.IO connected'
-                          : 'Socket.IO disconnected',
-                  active:
-                      socketConnected,
-                ),
-
-                const SizedBox(
-                  height: 15,
-                ),
-
-                _statusTile(
-                  icon:
-                      Icons.data_object_rounded,
-                  title:
-                      'SOS Data',
-                  status:
-                      sosData != null
-                          ? 'Prepared locally'
-                          : 'Not prepared',
-                  active:
-                      sosData != null,
-                ),
-
-                const SizedBox(
-                  height: 20,
-                ),
-
-                if (hasLocation)
-                  Container(
-                    width:
-                        double.infinity,
-
-                    padding:
-                        const EdgeInsets.all(
-                      18,
-                    ),
-
-                    decoration:
-                        BoxDecoration(
-                      color:
-                          Colors.white.withOpacity(
-                        0.08,
-                      ),
-
-                      borderRadius:
-                          BorderRadius.circular(
-                        18,
-                      ),
-                    ),
-
-                    child: Column(
-                      crossAxisAlignment:
-                          CrossAxisAlignment
-                              .start,
-
-                      children: [
-                        const Text(
-                          'Captured GPS Data',
-
-                          style:
-                              TextStyle(
-                            color:
-                                Colors.white,
-                            fontWeight:
-                                FontWeight.bold,
-                            fontSize:
-                                16,
-                          ),
-                        ),
-
-                        const SizedBox(
-                          height: 12,
-                        ),
-
-                        _detailRow(
-                          'Latitude',
-                          position!
-                              .latitude
-                              .toStringAsFixed(
-                            6,
-                          ),
-                        ),
-
-                        _detailRow(
-                          'Longitude',
-                          position!
-                              .longitude
-                              .toStringAsFixed(
-                            6,
-                          ),
-                        ),
-
-                        _detailRow(
-                          'Accuracy',
-                          '${position!.accuracy.toStringAsFixed(1)} m',
-                        ),
-                      ],
-                    ),
-                  ),
-
-                const SizedBox(
-                  height: 30,
-                ),
-
-                // ==================================================
-                // SHARE LOCATION
-                // ==================================================
-
-                SizedBox(
-                  width:
-                      double.infinity,
-
-                  height: 55,
-
-                  child:
-                      OutlinedButton.icon(
-                    onPressed:
-                        onShareLocation,
-
-                    style:
-                        OutlinedButton
-                            .styleFrom(
-                      foregroundColor:
-                          Colors.white,
-
-                      side:
-                          const BorderSide(
-                        color:
-                            Colors.white38,
-                      ),
-                    ),
-
-                    icon:
-                        const Icon(
-                      Icons.share_location,
-                    ),
-
-                    label:
-                        const Text(
-                      'SHARE CAPTURED LOCATION',
-                    ),
-                  ),
-                ),
-
-                const SizedBox(
-                  height: 12,
-                ),
-
-                // ==================================================
-                // UPLOAD AUDIO
-                // ==================================================
-
-                if (recordingPath !=
-                        null &&
-                    !audioUploaded)
-                  SizedBox(
-                    width:
-                        double.infinity,
-
-                    height: 55,
-
-                    child:
-                        OutlinedButton.icon(
-                      onPressed:
-                          audioUploading
-                              ? null
-                              : onUploadAudio,
-
-                      style:
-                          OutlinedButton
-                              .styleFrom(
-                        foregroundColor:
-                            Colors.white,
-
-                        side:
-                            const BorderSide(
-                          color:
-                              Colors.white38,
-                        ),
-                      ),
-
-                      icon:
-                          audioUploading
-                              ? const SizedBox(
-                                  width:
-                                      20,
-                                  height:
-                                      20,
-                                  child:
-                                      CircularProgressIndicator(
-                                    strokeWidth:
-                                        2,
-                                  ),
-                                )
-                              : const Icon(
-                                  Icons.cloud_upload,
-                                ),
-
-                      label:
-                          Text(
-                        audioUploading
-                            ? 'UPLOADING AUDIO...'
-                            : 'UPLOAD AUDIO',
-                      ),
-                    ),
-                  ),
-
-                const SizedBox(
-                  height: 12,
-                ),
-
-                // ==================================================
-                // CALL 112
-                // ==================================================
-
-                SizedBox(
-                  width:
-                      double.infinity,
-
-                  height: 55,
-
-                  child:
-                      ElevatedButton.icon(
-                    onPressed:
-                        onCallEmergencyServices,
-
-                    style:
-                        ElevatedButton
-                            .styleFrom(
-                      backgroundColor:
-                          Colors.red,
-
-                      foregroundColor:
-                          Colors.white,
-                    ),
-
-                    icon:
-                        const Icon(
-                      Icons.phone,
-                    ),
-
-                    label:
-                        const Text(
-                      'CALL 112',
-                    ),
-                  ),
-                ),
-
-                const SizedBox(
-                  height: 12,
-                ),
-
-                // ==================================================
-                // END SOS
-                // ==================================================
-
-                SizedBox(
-                  width:
-                      double.infinity,
-
-                  height: 60,
-
-                  child:
-                      ElevatedButton.icon(
-                    onPressed:
-                        onEndSos,
-
-                    style:
-                        ElevatedButton
-                            .styleFrom(
-                      backgroundColor:
-                          Colors.white,
-
-                      foregroundColor:
-                          Colors.red.shade900,
-
-                      shape:
-                          RoundedRectangleBorder(
-                        borderRadius:
-                            BorderRadius.circular(
-                          18,
-                        ),
-                      ),
-                    ),
-
-                    icon:
-                        const Icon(
-                      Icons.stop_circle,
-                    ),
-
-                    label:
-                        const Text(
-                      'END SOS',
-
-                      style:
-                          TextStyle(
-                        fontWeight:
-                            FontWeight.bold,
-                        fontSize:
-                            17,
-                      ),
-                    ),
-                  ),
-                ),
-
-                const SizedBox(
-                  height: 15,
-                ),
-
-                const Text(
-                  'Ending SOS stops emergency recording and resumes keyword protection.',
-
-                  textAlign:
-                      TextAlign.center,
-
-                  style:
-                      TextStyle(
-                    color:
-                        Colors.white54,
-                    fontSize:
-                        12,
-                  ),
-                ),
-
-                const SizedBox(
-                  height: 15,
-                ),
-              ],
-            ),
-          ),
-        ),
-      ),
-    );
-  }
-
-  // ==========================================================
-  // STATUS TILE
-  // ==========================================================
 
   Widget _statusTile({
     required IconData icon,
@@ -2937,145 +1838,79 @@ class EmergencyScreen
     required bool active,
   }) {
     return Container(
-      width:
-          double.infinity,
-
-      padding:
-          const EdgeInsets.all(18),
-
-      decoration:
-          BoxDecoration(
-        color:
-            Colors.white.withOpacity(
-          0.08,
-        ),
-
-        borderRadius:
-            BorderRadius.circular(
-          18,
-        ),
-
-        border:
-            Border.all(
-          color:
-              active
-                  ? Colors.green.withOpacity(
-                      0.5,
-                    )
-                  : Colors.white12,
+      width: double.infinity,
+      padding: const EdgeInsets.all(15),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.07),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: active
+              ? Colors.green.withValues(alpha: 0.4)
+              : Colors.white12,
         ),
       ),
-
       child: Row(
         children: [
           Icon(
             icon,
-
-            color:
-                active
-                    ? Colors.greenAccent
-                    : Colors.white54,
-
-            size:
-                30,
+            color: active ? Colors.greenAccent : Colors.white54,
           ),
-
-          const SizedBox(
-            width: 15,
-          ),
-
+          const SizedBox(width: 12),
           Expanded(
             child: Column(
-              crossAxisAlignment:
-                  CrossAxisAlignment
-                      .start,
-
+              crossAxisAlignment: CrossAxisAlignment.start,
               children: [
                 Text(
                   title,
-
-                  style:
-                      const TextStyle(
-                    color:
-                        Colors.white,
-                    fontWeight:
-                        FontWeight.bold,
-                    fontSize:
-                        16,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.w600,
                   ),
                 ),
-
-                const SizedBox(
-                  height: 4,
-                ),
-
+                const SizedBox(height: 4),
                 Text(
                   status,
-
-                  style: TextStyle(
-                    color:
-                        active
-                            ? Colors.greenAccent
-                            : Colors.white54,
-                    fontSize:
-                        13,
+                  style: const TextStyle(
+                    color: Colors.white70,
+                    fontSize: 13,
                   ),
                 ),
               ],
             ),
           ),
-
           Icon(
-            active
-                ? Icons.check_circle
-                : Icons.cancel,
-
-            color:
-                active
-                    ? Colors.greenAccent
-                    : Colors.white38,
+            active ? Icons.check_circle : Icons.info_outline,
+            color: active ? Colors.greenAccent : Colors.white38,
+            size: 20,
           ),
         ],
       ),
     );
   }
 
-  // ==========================================================
-  // DETAIL ROW
-  // ==========================================================
-
-  Widget _detailRow(
-    String label,
-    String value,
-  ) {
+  Widget _detailRow(String label, String value) {
     return Padding(
-      padding:
-          const EdgeInsets.symmetric(
-        vertical: 4,
-      ),
-
+      padding: const EdgeInsets.symmetric(vertical: 5),
       child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
         children: [
-          Text(
-            '$label: ',
-
-            style:
-                const TextStyle(
-              color:
-                  Colors.white54,
+          SizedBox(
+            width: 90,
+            child: Text(
+              label,
+              style: const TextStyle(
+                color: Colors.white60,
+                fontSize: 13,
+              ),
             ),
           ),
-
           Expanded(
             child: Text(
               value,
-
-              style:
-                  const TextStyle(
-                color:
-                    Colors.white,
-                fontWeight:
-                    FontWeight.w600,
+              style: const TextStyle(
+                color: Colors.white,
+                fontSize: 13,
+                fontWeight: FontWeight.w500,
               ),
             ),
           ),
@@ -3083,4 +1918,383 @@ class EmergencyScreen
       ),
     );
   }
+
+  @override
+  Widget build(BuildContext context) {
+    final hasLocation = position != null;
+
+    return PopScope(
+      canPop: false,
+      child: Scaffold(
+        backgroundColor: const Color(0xFF160909),
+        body: SafeArea(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(24),
+            child: Column(
+              children: [
+                const SizedBox(height: 25),
+                const Icon(
+                  Icons.warning_rounded,
+                  color: Colors.red,
+                  size: 65,
+                ),
+                const SizedBox(height: 15),
+                const Text(
+                  'EMERGENCY MODE',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 27,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 1,
+                  ),
+                ),
+                const SizedBox(height: 8),
+                Text(
+                  triggeredByKeyword
+                      ? 'Activated by secret phrase'
+                      : 'Activated manually',
+                  style: const TextStyle(
+                    color: Colors.white70,
+                    fontSize: 15,
+                  ),
+                ),
+                const SizedBox(height: 25),
+
+                if (triggeredByKeyword)
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(16),
+                    decoration: BoxDecoration(
+                      color: Colors.red.withValues(alpha: 0.12),
+                      borderRadius: BorderRadius.circular(16),
+                      border: Border.all(
+                        color: Colors.red.withValues(alpha: 0.35),
+                      ),
+                    ),
+                    child: Row(
+                      children: [
+                        const Icon(
+                          Icons.record_voice_over,
+                          color: Colors.redAccent,
+                        ),
+                        const SizedBox(width: 12),
+                        Expanded(
+                          child: Text(
+                            'Secret phrase detected: "$secretPhrase"',
+                            style: const TextStyle(
+                              color: Colors.white,
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+
+                if (triggeredByKeyword) const SizedBox(height: 15),
+
+                _statusTile(
+                  icon: Icons.location_on,
+                  title: 'GPS Location',
+                  status: hasLocation
+                      ? 'Location captured'
+                      : 'Location unavailable',
+                  active: hasLocation,
+                ),
+                const SizedBox(height: 15),
+
+                _statusTile(
+                  icon: Icons.mic,
+                  title: 'Emergency Audio',
+                  status: isRecording
+                      ? 'Recording active'
+                      : 'Recording stopped or unavailable',
+                  active: isRecording,
+                ),
+                const SizedBox(height: 15),
+
+                _statusTile(
+                  icon: Icons.cloud_done,
+                  title: 'Backend Alert',
+                  status: alertSent ? 'Alert sent' : backendStatus,
+                  active: alertSent,
+                ),
+                const SizedBox(height: 15),
+
+                _statusTile(
+                  icon: Icons.cloud_upload,
+                  title: 'Cloud Audio',
+                  status: audioUploading
+                      ? 'Uploading...'
+                      : audioUploaded
+                          ? 'Uploaded'
+                          : audioUploadStatus,
+                  active: audioUploaded,
+                ),
+                const SizedBox(height: 15),
+
+                _statusTile(
+                  icon: Icons.wifi,
+                  title: 'Real-Time Network',
+                  status: socketConnected
+                      ? 'Socket.IO connected'
+                      : 'Socket.IO disconnected',
+                  active: socketConnected,
+                ),
+                const SizedBox(height: 15),
+
+                _statusTile(
+                  icon: Icons.data_object_rounded,
+                  title: 'SOS Data',
+                  status: sosData != null
+                      ? 'Prepared locally'
+                      : 'Not prepared',
+                  active: sosData != null,
+                ),
+                const SizedBox(height: 20),
+
+                if (hasLocation)
+                  Container(
+                    width: double.infinity,
+                    padding: const EdgeInsets.all(18),
+                    decoration: BoxDecoration(
+                      color: Colors.white.withValues(alpha: 0.08),
+                      borderRadius: BorderRadius.circular(18),
+                    ),
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        const Text(
+                          'Captured GPS Data',
+                          style: TextStyle(
+                            color: Colors.white,
+                            fontWeight: FontWeight.bold,
+                            fontSize: 16,
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        _detailRow(
+                          'Latitude',
+                          position!.latitude.toStringAsFixed(6),
+                        ),
+                        _detailRow(
+                          'Longitude',
+                          position!.longitude.toStringAsFixed(6),
+                        ),
+                        _detailRow(
+                          'Accuracy',
+                          '${position!.accuracy.toStringAsFixed(1)} m',
+                        ),
+                      ],
+                    ),
+                  ),
+
+                const SizedBox(height: 30),
+
+                // Existing location-sharing button
+                SizedBox(
+                  width: double.infinity,
+                  height: 55,
+                  child: OutlinedButton.icon(
+                    onPressed: onShareLocation,
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.white,
+                      side: const BorderSide(color: Colors.white38),
+                    ),
+                    icon: const Icon(Icons.share_location),
+                    label: const Text('SHARE CAPTURED LOCATION'),
+                  ),
+                ),
+                const SizedBox(height: 12),
+
+                // NEW: Message a saved trusted contact
+                SizedBox(
+                  width: double.infinity,
+                  height: 55,
+                  child: ElevatedButton.icon(
+                    onPressed: onMessageTrustedContact,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.orange.shade800,
+                      foregroundColor: Colors.white,
+                    ),
+                    icon: const Icon(Icons.sms),
+                    label: const Text('MESSAGE TRUSTED CONTACT'),
+                  ),
+                ),
+                const SizedBox(height: 12),
+
+                // Existing audio upload button
+                if (recordingPath != null &&
+                    !isRecording &&
+                    !audioUploaded)
+                  SizedBox(
+                    width: double.infinity,
+                    height: 55,
+                    child: OutlinedButton.icon(
+                      onPressed: audioUploading ? null : onUploadAudio,
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: Colors.white,
+                        side: const BorderSide(color: Colors.white38),
+                      ),
+                      icon: audioUploading
+                          ? const SizedBox(
+                              width: 20,
+                              height: 20,
+                              child: CircularProgressIndicator(
+                                strokeWidth: 2,
+                              ),
+                            )
+                          : const Icon(Icons.cloud_upload),
+                      label: Text(
+                        audioUploading
+                            ? 'UPLOADING AUDIO...'
+                            : 'UPLOAD AUDIO',
+                      ),
+                    ),
+                  ),
+
+                const SizedBox(height: 12),
+
+                // Existing emergency call button
+                SizedBox(
+                  width: double.infinity,
+                  height: 55,
+                  child: ElevatedButton.icon(
+                    onPressed: onCallEmergencyServices,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.red,
+                      foregroundColor: Colors.white,
+                    ),
+                    icon: const Icon(Icons.phone),
+                    label: const Text('CALL 112'),
+                  ),
+                ),
+                const SizedBox(height: 12),
+
+                // Existing end SOS button
+                SizedBox(
+                  width: double.infinity,
+                  height: 60,
+                  child: ElevatedButton.icon(
+                    onPressed: onEndSos,
+                    style: ElevatedButton.styleFrom(
+                      backgroundColor: Colors.white,
+                      foregroundColor: Colors.red.shade900,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(18),
+                      ),
+                    ),
+                    icon: const Icon(Icons.stop_circle),
+                    label: const Text(
+                      'END SOS',
+                      style: TextStyle(
+                        fontWeight: FontWeight.bold,
+                        fontSize: 17,
+                      ),
+                    ),
+                  ),
+                ),
+                const SizedBox(height: 15),
+
+                const Text(
+                  'Ending SOS stops emergency recording and resumes keyword protection.',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    color: Colors.white54,
+                    fontSize: 12,
+                  ),
+                ),
+                const SizedBox(height: 15),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
 }
+  // STATUS TILE
+  Widget _statusTile({
+    required IconData icon,
+    required String title,
+    required String status,
+    required bool active,
+  }) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(18),
+      decoration: BoxDecoration(
+        color: Colors.white.withValues(alpha: 0.08),
+        borderRadius: BorderRadius.circular(18),
+        border: Border.all(
+          color: active
+              ? Colors.green.withValues(alpha: 0.5)
+              : Colors.white12,
+        ),
+      ),
+      child: Row(
+        children: [
+          Icon(
+            icon,
+            color: active ? Colors.greenAccent : Colors.white54,
+            size: 30,
+          ),
+          const SizedBox(width: 15),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  title,
+                  style: const TextStyle(
+                    color: Colors.white,
+                    fontWeight: FontWeight.bold,
+                    fontSize: 16,
+                  ),
+                ),
+                const SizedBox(height: 4),
+                Text(
+                  status,
+                  style: TextStyle(
+                    color: active
+                        ? Colors.greenAccent
+                        : Colors.white54,
+                    fontSize: 13,
+                  ),
+                ),
+              ],
+            ),
+          ),
+          Icon(
+            active ? Icons.check_circle : Icons.cancel,
+            color: active ? Colors.greenAccent : Colors.white38,
+          ),
+        ],
+      ),
+    );
+  }
+
+  // DETAIL ROW
+  Widget _detailRow(String label, String value) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 4),
+      child: Row(
+        children: [
+          Text(
+            '$label: ',
+            style: const TextStyle(color: Colors.white54),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              style: const TextStyle(
+                color: Colors.white,
+                fontWeight: FontWeight.w600,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }

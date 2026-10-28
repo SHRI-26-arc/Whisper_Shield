@@ -1,0 +1,29 @@
+{
+  "project_info": {
+    "project_number": "1012322653784",
+    "project_id": "whisper-shield",
+    "storage_bucket": "whisper-shield.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1012322653784:android:9381592c0718c495a85c2d",
+        "android_client_info": {
+          "package_name": "com.example.whisper_shield"
+        }
+      },
+      "oauth_client": [],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDGJiBeRMsFNeXELKO-2hC6fZaNTm-5o7c"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": []
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
